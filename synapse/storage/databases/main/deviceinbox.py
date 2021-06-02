@@ -569,6 +569,11 @@ class DeviceInboxBackgroundUpdateStore(SQLBaseStore):
             self.DEVICE_INBOX_STREAM_ID, self._background_drop_index_device_inbox
         )
 
+        self.db_pool.updates.register_background_update_handler(
+            "remove_zombie_rows_in_device_inbox",
+            self._remove_zombie_rows_in_device_inbox,
+        )
+
     async def _background_drop_index_device_inbox(self, progress, batch_size):
         def reindex_txn(conn):
             txn = conn.cursor()
@@ -581,6 +586,67 @@ class DeviceInboxBackgroundUpdateStore(SQLBaseStore):
 
         return 1
 
+    async def _remove_zombie_rows_in_device_inbox(self, progress: dict, batch_size: int) -> int:
+        """A background update that deletes all zombie rows for deleted and
+        hidden devices in device_inbox.
+        """
+        # needed for background update table
+        last_stream_id = progress.get("last_stream_id", 0)
+
+        # Idea is: get only the integer back, manual sql execution gives columnname + stream_id
+        # needed to determine the upper limit for the next function
+        def _get_max_stream_id(txn) -> int:
+            sql = """
+                SELECT stream_id FROM device_inbox ORDER BY stream_id DESC LIMIT 1;
+            """
+
+            txn.execute(sql)
+            return int(max_stream_id)
+
+
+        def _delete_zombie_rows_in_device_inbox(txn) -> int:
+
+            # manually tested with psql
+            # use >= to get started with 0, in case it is the first stream_id
+            sql = """
+                DELETE FROM device_inbox
+                WHERE (device_id IN (SELECT device_id FROM devices WHERE hidden=TRUE)
+                OR device_id NOT IN (SELECT device_id FROM devices))
+                AND stream_id >= ?
+                AND stream_id < ?;
+            """
+
+            # use first value from dict last_stream_id, assume it is an integer initialised with 0
+            # stream_id_plus_batch_size = last_stream_id[0] + batch_size
+            last_stream_id[1] = last_stream_id[0] + batch_size
+
+            # execute querry
+            # txn.execute(sql, (last_stream_id[0], stream_id_plus_batch_size))
+            txn.execute(sql, (last_stream_id[0], last_stream_id[1]))
+
+            # update counter
+            #last_stream_id[0] = stream_id_plus_batch_size
+            last_stream_id[0] = last_stream_id[1]
+
+            # update background update progress
+            # stream_id not defined
+            if stream_id:
+                self.db_pool.updates._background_update_progress_txn(
+                    txn, "remove_zombie_rows_in_device_inbox", {"last_stream_id": stream_id[-1][0]}
+                )
+
+            return len(stream_id)
+
+        # call the delete function itself
+        number_deleted = await self.db_pool.runInteraction(
+            "_remove_zombie_rows_in_device_inbox", _delete_zombie_rows_in_device_inbox
+        )
+
+        # ending condition for this backgroud update task
+        if last_stream_id[0] >= max_stream_id:
+            await self.db_pool.updates._end_background_update("remove_zombie_rows_in_device_inbox")
+
+        return number_deleted
 
 class DeviceInboxStore(DeviceInboxWorkerStore, DeviceInboxBackgroundUpdateStore):
     pass
